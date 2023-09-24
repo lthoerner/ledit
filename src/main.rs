@@ -6,13 +6,19 @@ use crossterm::style;
 use crossterm::terminal;
 use crossterm::{execute, queue};
 
+#[derive(Default)]
+struct LineBuffer {
+    buffer: String,
+    cursor_index: u16,
+}
+
 fn main() {
     prompt("$ ");
 }
 
 fn prompt(prefix: &str) -> String {
     let forbidden_area = prefix.chars().count() as u16;
-    let mut line_buffer = String::new();
+    let mut line_buffer = LineBuffer::default();
 
     terminal::enable_raw_mode().unwrap();
     let mut stdout = stdout();
@@ -21,19 +27,19 @@ fn prompt(prefix: &str) -> String {
     loop {
         if handle(&mut stdout, &mut line_buffer, event::read().unwrap()) {
             terminal::disable_raw_mode().unwrap();
-            return line_buffer;
+            return line_buffer.buffer;
         }
     }
 }
 
-fn handle(stdout: &mut Stdout, line: &mut String, event: event::Event) -> bool {
+fn handle(stdout: &mut Stdout, line: &mut LineBuffer, event: event::Event) -> bool {
     match event {
         event::Event::Key(key_event) => {
             if key_event.modifiers == event::KeyModifiers::NONE {
                 match key_event.code {
                     event::KeyCode::Char(c) => {
                         execute!(stdout, style::Print(c)).unwrap();
-                        line.push(c);
+                        line.buffer.push(c);
                     }
                     event::KeyCode::Backspace => {
                         execute!(
@@ -43,7 +49,7 @@ fn handle(stdout: &mut Stdout, line: &mut String, event: event::Event) -> bool {
                             cursor::MoveLeft(1)
                         )
                         .unwrap();
-                        line.pop();
+                        line.buffer.pop();
                     }
                     event::KeyCode::Left => execute!(stdout, cursor::MoveLeft(1)).unwrap(),
                     event::KeyCode::Right => execute!(stdout, cursor::MoveRight(1)).unwrap(),
