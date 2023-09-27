@@ -84,10 +84,14 @@ impl LineBuffer {
         self.buffer.chars().count()
     }
 
-    /// Calculates the combined height of the prompt and line buffer in relation to the terminal width.
+    /// Calculates the height of the prompt and line buffer in relation to the terminal width.
+    /// Makes some adjustments for an edge case where the line takes up the entire terminal.
     fn height(&self, ctx: &Context) -> usize {
+        // If the a line of text takes up the entire width of the terminal, the cursor will be on
+        // the line below it, so this offset is required for scrolling to work properly
+        let true_width = ctx.prompt_width + self.width() + 1;
         // Quotient is rounded up to account for partial lines
-        ciel_divide(ctx.prompt_width + self.width(), ctx.terminal_width)
+        ciel_div(true_width, ctx.terminal_width)
     }
 
     fn segment(&self, scroll: ScrollState, terminal_width: usize) -> &str {
@@ -102,7 +106,11 @@ impl LineBuffer {
 }
 
 fn main() {
-    let input = prompt("$ ");
+    for _ in 0..5 {
+        println!();
+    }
+
+    let input = prompt("***$ ");
     println!("{input}");
 }
 
@@ -230,13 +238,14 @@ fn update_scroll(ctx: &mut Context, line: &LineBuffer) {
         ScrollState::Unscrolled { y_origin } => {
             let lines = line.height(ctx);
             // $ Check for off-by-1s here
-            let remaining_space = ctx.terminal_height - y_origin;
-            if lines > remaining_space {
-                let overrun = lines - remaining_space;
+            let utilized_height = ctx.terminal_height - y_origin;
+            let remaining_height = ctx.terminal_height - utilized_height;
+            if lines > utilized_height {
+                let overrun = lines - utilized_height;
                 scroll_down(ctx, overrun);
 
                 // If enough lines are inserted at once, `ScrollState::Scrolled` must be skipped
-                ctx.scroll = match overrun > remaining_space {
+                ctx.scroll = match overrun > remaining_height {
                     true => ScrollState::ScrolledPastPrompt {
                         scroll: overrun - y_origin,
                     },
@@ -249,21 +258,30 @@ fn update_scroll(ctx: &mut Context, line: &LineBuffer) {
         }
         ScrollState::Scrolled { y_origin, scroll } => {
             let lines = line.height(ctx);
-            if lines > ctx.terminal_height {
-                let overrun = lines.abs_diff(ctx.terminal_height);
+            let utilized_height = ctx.terminal_height - y_origin + scroll;
+            let remaining_height = ctx.terminal_height - utilized_height;
+            if lines > utilized_height {
+                let overrun = lines - utilized_height;
                 scroll_down(ctx, overrun);
 
-                ctx.scroll = ScrollState::ScrolledPastPrompt {
-                    scroll: scroll + overrun - y_origin,
-                }
+                ctx.scroll = match overrun > remaining_height {
+                    true => ScrollState::ScrolledPastPrompt {
+                        scroll: scroll + overrun - y_origin,
+                    },
+                    false => ScrollState::Scrolled {
+                        y_origin,
+                        scroll: scroll + overrun,
+                    },
+                };
             }
         }
         ScrollState::ScrolledPastPrompt { scroll } => {
-            let lines_on_screen = line.height(ctx) - scroll;
+            let mut lines_on_screen = line.height(ctx) - scroll;
             if lines_on_screen > ctx.terminal_height {
                 let overrun = lines_on_screen - ctx.terminal_height;
                 scroll_down(ctx, overrun);
 
+                lines_on_screen -= overrun;
                 ctx.scroll = ScrollState::ScrolledPastPrompt {
                     scroll: scroll + overrun,
                 };
@@ -321,7 +339,7 @@ fn cursor_y_coord(ctx: &Context, line: &LineBuffer) -> u16 {
     let base = true_index(ctx, line) / ctx.terminal_width;
     let y = match ctx.scroll {
         ScrollState::Unscrolled { y_origin } => base + y_origin,
-        ScrollState::Scrolled { y_origin, scroll } => base + (y_origin - scroll),
+        ScrollState::Scrolled { y_origin, scroll } => base + y_origin - scroll,
         ScrollState::ScrolledPastPrompt { scroll } => base - scroll,
     };
 
@@ -355,6 +373,10 @@ fn exit(code: i32, msg: &str) -> ! {
     std::process::exit(code);
 }
 
-fn ciel_divide(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
+fn ciel_div(a: usize, b: usize) -> usize {
+    let mut result = a / b;
+    if a % b > 0 {
+        result += 1;
+    }
+    result
 }
