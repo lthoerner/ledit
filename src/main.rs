@@ -13,9 +13,29 @@ struct LineBuffer {
 }
 
 struct Context {
+    // Stdout is stored to prevent needing to call `std::io::stdout()` repeatedly
     stdout: Stdout,
-    y_origin: u16,
+    // The prompt width is needed to accurately calculate the cursor position
     prompt_width: usize,
+    // The terminal size is neededed for almost all calculations
+    // $ This will need to be continuously updated once resizing is supported
+    terminal_width: usize,
+    terminal_height: usize,
+    scroll: ScrollState,
+}
+
+/// Represents the amount of scrolling that has occurred so far.
+/// This information is crucial for calculations relating to the cursor position.
+#[derive(Clone)]
+enum ScrollState {
+    // The y origin is the original y-coordinate of the prompt, which will be offset by the scroll
+    Unscrolled { y_origin: usize },
+    // Once the line has gotten longer than the terminal height, different calculations are required
+    // to determine the position of the cursor and the viewport
+    Scrolled { y_origin: usize, scroll: usize },
+    // Once the editor scrolls past the prompt, the original prompt position becomes irrelevant to
+    // position calculations, so the scroll here represents the number of lines off-screen
+    ScrolledPastPrompt { scroll: usize },
 }
 
 impl LineBuffer {
@@ -59,6 +79,26 @@ impl LineBuffer {
     fn delete(&mut self) {
         self.buffer.remove(self.cursor_index);
     }
+
+    fn width(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    /// Calculates the combined height of the prompt and line buffer in relation to the terminal width.
+    fn height(&self, ctx: &Context) -> usize {
+        // Quotient is rounded up to account for partial lines
+        ciel_divide(ctx.prompt_width + self.width(), ctx.terminal_width)
+    }
+
+    fn segment(&self, scroll: ScrollState, terminal_width: usize) -> &str {
+        if let ScrollState::ScrolledPastPrompt { scroll } = scroll {
+            let chars_off_screen = terminal_width * scroll;
+            // $ Needs to be changed to some sort of safe slicing
+            &self.buffer[chars_off_screen..]
+        } else {
+            &self.buffer
+        }
+    }
 }
 
 fn main() {
@@ -68,10 +108,15 @@ fn main() {
 
 fn prompt(prefix: &str) -> String {
     let mut line_buffer = LineBuffer::default();
+    let (terminal_width, terminal_height) = terminal::size().unwrap();
     let mut ctx = Context {
         stdout: stdout(),
-        y_origin: cursor::position().unwrap().1,
         prompt_width: prefix.chars().count(),
+        terminal_width: terminal_width as usize,
+        terminal_height: terminal_height as usize,
+        scroll: ScrollState::Unscrolled {
+            y_origin: cursor::position().unwrap().1 as usize,
+        },
     };
 
     terminal::enable_raw_mode().unwrap();
@@ -92,15 +137,15 @@ fn handle(ctx: &mut Context, line: &mut LineBuffer, event: Event) -> bool {
                 match key_event.code {
                     KeyCode::Char(c) => {
                         line.insert(c);
-                        redraw_buffer(ctx, line);
+                        update_screen(ctx, line, true);
                     }
                     KeyCode::Backspace => {
                         line.backspace();
-                        redraw_buffer(ctx, line);
+                        update_screen(ctx, line, false);
                     }
                     KeyCode::Delete => {
                         line.delete();
-                        redraw_buffer(ctx, line);
+                        update_screen(ctx, line, false);
                     }
                     KeyCode::Left => {
                         line.left();
@@ -119,11 +164,11 @@ fn handle(ctx: &mut Context, line: &mut LineBuffer, event: Event) -> bool {
                 match key_event.code {
                     KeyCode::Char(c) => {
                         line.insert(c);
-                        redraw_buffer(ctx, line);
+                        update_screen(ctx, line, true);
                     }
                     KeyCode::Right => {
                         line.insert_str("DEBUG ");
-                        redraw_buffer(ctx, line);
+                        update_screen(ctx, line, true);
                     }
                     _ => exit(1, "UNSUPPORTED KEY COMBINATION"),
                 }
@@ -135,7 +180,8 @@ fn handle(ctx: &mut Context, line: &mut LineBuffer, event: Event) -> bool {
             }
         }
         Event::Mouse(_) => exit(1, "MOUSE CAPTURE SHOULD BE DISABLED"),
-        Event::Resize(_, _) => todo!(), // Need to reflow the text most likely
+        // Need to reflow the text most likely
+        Event::Resize(_, _) => exit(1, "RESIZING IS NOT SUPPORTED YET"),
         Event::FocusGained => (),
         Event::FocusLost => (),
         Event::Paste(_) => exit(1, "BRACKETED PASTE SHOULD BE DISABLED"),
@@ -144,44 +190,171 @@ fn handle(ctx: &mut Context, line: &mut LineBuffer, event: Event) -> bool {
     false
 }
 
-fn redraw_buffer(ctx: &mut Context, line: &LineBuffer) {
+/// Updates the frame by (optionally) scrolling, updating the cursor, and redrawing the line buffer.
+fn update_screen(ctx: &mut Context, line: &LineBuffer, scroll: bool) {
+    if scroll {
+        update_scroll(ctx, line)
+    };
+
     update_cursor(ctx, line);
+    redraw_buffer(ctx, line);
+}
+
+fn redraw_buffer(ctx: &mut Context, line: &LineBuffer) {
+    let (draw_start_x, draw_start_y) = prompt_end_coord(ctx);
+    let scroll = ctx.scroll.clone();
+    let terminal_width = ctx.terminal_width;
     execute!(ctx.stdout, cursor::SavePosition).unwrap();
     queue!(
         ctx.stdout,
         terminal::Clear(terminal::ClearType::FromCursorDown),
-        // $ This will cause a bug if the prompt is wider than the terminal, need to divide
-        cursor::MoveTo(ctx.prompt_width as u16, ctx.y_origin),
-        Print(&line.buffer)
+        cursor::MoveTo(draw_start_x, draw_start_y),
+        Print(line.segment(scroll, terminal_width))
     )
     .unwrap();
     execute!(ctx.stdout, cursor::RestorePosition).unwrap();
 }
 
+/// Updates the position of the cursor depending on the scroll state and the buffer index.
+/// This should be called after `update_scroll()`.
 fn update_cursor(ctx: &mut Context, line: &LineBuffer) {
-    let terminal_height = terminal::size().unwrap().1;
-    let (x, y) = cursor_index_to_coord(ctx, line.cursor_index);
-    // If the cursor must overrun the end of the terminal window, the terminal must be scrolled down
-    if y > terminal_height {
-        // TODO: Viewport calculations and scrolling
-    }
-
+    let (x, y) = cursor_coord(ctx, line);
     execute!(ctx.stdout, cursor::MoveTo(x, y)).unwrap();
 }
 
-// $ This will probably cause a bug when the terminal is resized or when the user scrolls
-fn cursor_index_to_coord(ctx: &mut Context, cursor_index: usize) -> (u16, u16) {
-    let terminal_width = terminal::size().unwrap().0;
-    let true_position = ctx.prompt_width + cursor_index;
+/// Scrolls the terminal down the necessary amount of lines, changing the scroll state as needed.
+/// This should generally be called first in the event that any text is added to the buffer.
+fn update_scroll(ctx: &mut Context, line: &LineBuffer) {
+    // Check if scroll is required, and if it is, scroll as needed and update the scroll state
+    match ctx.scroll {
+        ScrollState::Unscrolled { y_origin } => {
+            let lines = line.height(ctx);
+            // $ Check for off-by-1s here
+            let remaining_space = ctx.terminal_height - y_origin;
+            if lines > remaining_space {
+                let overrun = lines - remaining_space;
+                scroll_down(ctx, overrun);
 
-    let x = (true_position % terminal_width as usize) as u16;
-    let y = ctx.y_origin + (true_position / terminal_width as usize) as u16;
+                // If enough lines are inserted at once, `ScrollState::Scrolled` must be skipped
+                ctx.scroll = match overrun > remaining_space {
+                    true => ScrollState::ScrolledPastPrompt {
+                        scroll: overrun - y_origin,
+                    },
+                    false => ScrollState::Scrolled {
+                        y_origin,
+                        scroll: overrun,
+                    },
+                };
+            }
+        }
+        ScrollState::Scrolled { y_origin, scroll } => {
+            let lines = line.height(ctx);
+            if lines > ctx.terminal_height {
+                let overrun = lines.abs_diff(ctx.terminal_height);
+                scroll_down(ctx, overrun);
 
-    (x, y)
+                ctx.scroll = ScrollState::ScrolledPastPrompt {
+                    scroll: scroll + overrun - y_origin,
+                }
+            }
+        }
+        ScrollState::ScrolledPastPrompt { scroll } => {
+            let lines_on_screen = line.height(ctx) - scroll;
+            if lines_on_screen > ctx.terminal_height {
+                let overrun = lines_on_screen - ctx.terminal_height;
+                scroll_down(ctx, overrun);
+
+                ctx.scroll = ScrollState::ScrolledPastPrompt {
+                    scroll: scroll + overrun,
+                };
+            }
+
+            // If the editor has been scrolled past the prompt, the last line should always be at
+            // the bottom, so the on-screen portion will always take up the entire terminal height
+            assert!(lines_on_screen == ctx.terminal_height);
+        }
+    }
+}
+
+/// Scrolls the terminal down a given number of lines.
+/// Does not preserve the cursor position.
+fn scroll_down(ctx: &mut Context, lines: usize) {
+    queue!(
+        ctx.stdout,
+        cursor::MoveTo(ctx.terminal_width as u16, ctx.terminal_height as u16)
+    )
+    .unwrap();
+
+    terminal::disable_raw_mode().unwrap();
+    for _ in 0..lines {
+        queue!(ctx.stdout, Print("\n")).unwrap();
+    }
+
+    execute!(ctx.stdout).unwrap();
+    terminal::enable_raw_mode().unwrap();
+}
+
+/// Calculates the index of the cursor, accounting for the offset introduced by the prompt text.
+fn true_index(ctx: &Context, line: &LineBuffer) -> usize {
+    ctx.prompt_width + line.cursor_index
+}
+
+// $ This will definitely cause a bug when the terminal is resized or when the user scrolls
+/// Calculates the coordinates of the cursor on the screen based on its index in the line buffer.
+/// These coordinates are only correct if the correct amount of scroll has already been applied.
+fn cursor_coord(ctx: &Context, line: &LineBuffer) -> (u16, u16) {
+    (cursor_x_coord(ctx, line), cursor_y_coord(ctx, line))
+}
+
+/// Calculates the cursor coordinates of the end of the prompt, used for redrawing the buffer.
+fn prompt_end_coord(ctx: &Context) -> (u16, u16) {
+    (prompt_end_x_coord(ctx), prompt_end_y_coord(ctx))
+}
+
+fn cursor_x_coord(ctx: &Context, line: &LineBuffer) -> u16 {
+    let x = (ctx.prompt_width + line.cursor_index) % ctx.terminal_width;
+    assert!(x < ctx.terminal_width);
+    x as u16
+}
+
+fn cursor_y_coord(ctx: &Context, line: &LineBuffer) -> u16 {
+    let base = true_index(ctx, line) / ctx.terminal_width;
+    let y = match ctx.scroll {
+        ScrollState::Unscrolled { y_origin } => base + y_origin,
+        ScrollState::Scrolled { y_origin, scroll } => base + (y_origin - scroll),
+        ScrollState::ScrolledPastPrompt { scroll } => base - scroll,
+    };
+
+    assert!(y < ctx.terminal_height);
+    y as u16
+}
+
+/// Calculates the x-coordinate of the end of the prompt, used for redrawing the buffer.
+fn prompt_end_x_coord(ctx: &Context) -> u16 {
+    let x = ctx.prompt_width % ctx.terminal_width;
+    assert!(x < ctx.terminal_width);
+    x as u16
+}
+
+/// Calculates the y-coordinate of the end of the prompt, used for redrawing the buffer.
+fn prompt_end_y_coord(ctx: &Context) -> u16 {
+    let base = ctx.prompt_width / ctx.terminal_width;
+    let y = match ctx.scroll {
+        ScrollState::Unscrolled { y_origin } => base + y_origin,
+        ScrollState::Scrolled { y_origin, scroll } => base + (y_origin - scroll),
+        ScrollState::ScrolledPastPrompt { scroll: _ } => 0,
+    };
+
+    assert!(y < ctx.terminal_height);
+    y as u16
 }
 
 fn exit(code: i32, msg: &str) -> ! {
     terminal::disable_raw_mode().unwrap();
     eprintln!("\n{}", msg);
     std::process::exit(code);
+}
+
+fn ciel_divide(a: usize, b: usize) -> usize {
+    (a + b - 1) / b
 }
